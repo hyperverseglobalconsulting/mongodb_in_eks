@@ -1,0 +1,11 @@
+apiVersion: eksctl.io/v1alpha5
+kind: ClusterConfig
+metadata:
+  name: mongodb-test
+  region: us-east-2
+managedNodeGroups:
+  - name: managed-worker-group
+    instanceType: t3.nano
+    desiredCapacity: 3
+    minSize: 1
+    maxSize: 3
