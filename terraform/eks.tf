@@ -1,102 +1,192 @@
-data "aws_instance" "bastian_instance" {
-  provider = aws.us_east_1
-  filter {
-    name   = "ip-address"
-    values = [var.bastion_host_ip]
-  }
-
-  filter {
-    name   = "tag:Name"
-    values = [var.bastian_name_tag]
-  }
+resource "aws_security_group" "eks_cluster_mgmt_one" {
+  name_prefix = "eks_cluster_mgmt_one"
+  vpc_id      = aws_vpc.k8s.id
 }
 
-data "aws_network_interface" "bastian_instance_network_interface" {
-  provider = aws.us_east_1
-  filter {
-    name   = "attachment.instance-id"
-    values = [data.aws_instance.bastian_instance.id]
-  }
-}
-
-resource "aws_security_group" "eks_cluster_security_group" {
-  name        = "${local.cluster_name}-eks-cluster-sg"
-  description = "EKS cluster security group"
-  vpc_id      = data.aws_network_interface.bastian_instance_network_interface.vpc_id
-
-  tags = {
-    Terraform = "true"
-    Cluster   = local.cluster_name
-  }
-}
-
-resource "aws_security_group_rule" "eks_cluster_sg_rule" {
-  security_group_id = aws_security_group.eks_cluster_security_group.id
+resource "aws_security_group_rule" "eks_cluster_mgmt_one" {
+  security_group_id = aws_security_group.eks_cluster_mgmt_one.id
 
   type        = "ingress"
   from_port   = 0
   to_port     = 65535
   protocol    = "tcp"
-#  cidr_blocks = []
-
-  source_security_group_id = element(tolist(data.aws_instance.bastian_instance.vpc_security_group_ids), 0)
+  source_security_group_id = aws_security_group.sg.id
+  depends_on = [
+    aws_security_group.sg,
+  ]
 }
 
-#resource "aws_security_group_rule" "eks_cluster_sg_rule" {
-#  security_group_id = aws_security_group.eks_cluster_security_group.id
-#
-#  type        = "ingress"
-#  from_port   = 0
-#  to_port     = 0
-#  protocol    = "tcp"
-#  cidr_blocks = []
-#
-#  source_security_group_id = element(data.aws_instance.bastian_instance.vpc_security_group_ids, 0)
-#}
+data "aws_ami" "eks_worker" {
+  filter {
+    name   = "name"
+    values = ["amazon-eks-node-1.21-v*"]
+  }
 
-module "eks" {
-  source  = "terraform-aws-modules/eks/aws"
-  version = "17.1.0"
+  most_recent = true
+  owners      = ["602401143452"] # Amazon EKS AMI account ID
+}
 
-  cluster_name = local.cluster_name
-  subnets      = module.vpc.private_subnets
-  cluster_version = var.cluster_version
+resource "aws_iam_role" "eks_cluster" {
+  name = "eks_cluster_role"
+
+  assume_role_policy = <<EOF
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "",
+      "Effect": "Allow",
+      "Principal": {
+        "Service": "eks.amazonaws.com"
+      },
+      "Action": "sts:AssumeRole"
+    }
+  ]
+}
+EOF
+}
+
+resource "aws_eks_cluster" "cluster" {
+  name     = "mongodb-in-eks"
+  role_arn = aws_iam_role.eks_cluster.arn
+
+  vpc_config {
+    subnet_ids = values(aws_subnet.public).*.id
+
+    endpoint_private_access = true
+    endpoint_public_access  = true
+
+    security_group_ids = [aws_security_group.eks_cluster_mgmt_one.id]
+  }
+
+  depends_on = [
+    aws_subnet.public
+  ]
+}
+
+resource "aws_iam_role" "node_group" {
+  name = "eks_node_group_role"
+
+  assume_role_policy = <<EOF
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "",
+      "Effect": "Allow",
+      "Principal": {
+        "Service": "ec2.amazonaws.com"
+      },
+      "Action": "sts:AssumeRole"
+    }
+  ]
+}
+EOF
+}
+
+resource "aws_eks_node_group" "node_group" {
+  cluster_name    = aws_eks_cluster.cluster.name
+  node_group_name = "eks_worker_group"
+  node_role_arn   = aws_iam_role.node_group.arn
+  subnet_ids      = values(aws_subnet.public).*.id
+
+  scaling_config {
+    desired_size = 1
+    max_size     = 1
+    min_size     = 1
+  }
+
+  instance_types = ["t3.micro"]
+
+  disk_size = 20
+
+  remote_access {
+    ec2_ssh_key =  aws_key_pair.kp.key_name
+  }
+  
+  ami_type = "AL2_x86_64"
 
   tags = {
     Terraform = "true"
-    Cluster   = local.cluster_name
+    EKS       = "mongodb-in-eks"
   }
 
-  vpc_id      = data.aws_network_interface.bastian_instance_network_interface.vpc_id
-
-  node_groups_defaults = {
-    ami_type  = "AL2_x86_64"
-  }
-
-  node_groups = {
-    managed-worker-group = {
-      desired_capacity = var.desired_capacity
-      max_capacity     = var.max_capacity
-      min_capacity     = var.min_capacity
-      instance_types   = [var.instance_type]
-    }
-  }
-
-  cluster_security_group_id = aws_security_group.eks_cluster_security_group.id
+  depends_on = [
+    aws_eks_cluster.cluster,
+    aws_key_pair.kp
+  ]
 }
 
-output "cluster_endpoint" {
-  description = "Endpoint for EKS control plane."
-  value       = module.eks.cluster_endpoint
+resource "aws_iam_role_policy_attachment" "eks_node_group_policy_attachment_1" {
+  role       = aws_iam_role.node_group.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy"
 }
 
-output "cluster_security_group_id" {
-  description = "Security group ID attached to the EKS control plane."
-  value       = module.eks.cluster_security_group_id
+resource "aws_iam_role_policy_attachment" "eks_node_group_policy_attachment_2" {
+  role       = aws_iam_role.node_group.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly"
 }
 
-output "cluster_id" {
-  description = "EKS cluster ID."
-  value       = module.eks.cluster_id
+data "aws_iam_policy" "AmazonEKSClusterPolicy" {
+  arn = "arn:aws:iam::aws:policy/AmazonEKSClusterPolicy"
 }
 
+resource "aws_iam_role_policy_attachment" "eks_cluster_role_policy_attach" {
+  role       = aws_iam_role.eks_cluster.name
+  policy_arn = data.aws_iam_policy.AmazonEKSClusterPolicy.arn
+}
+
+#module "eks" {
+#  source = "terraform-aws-modules/eks/aws"
+#
+#  cluster_name = "mongodb-in-eks"
+#  subnet_ids   = values(aws_subnet.public).*.id
+#
+#  cluster_endpoint_private_access = true
+#  cluster_endpoint_public_access  = true
+#
+#  tags = {
+#    Terraform = "true"
+#    EKS       = "mongodb-in-eks"
+#  }
+#
+#  vpc_id = aws_vpc.k8s.id
+#
+#  # Enable the creation of an OIDC provider for the EKS cluster
+#  enable_irsa = true
+#
+#  # Define the control plane security group rules
+##  cluster_security_group_id = aws_security_group.eks_cluster_mgmt_one.id
+#  cluster_additional_security_group_ids = [aws_security_group.eks_cluster_mgmt_one.id]
+#
+#  # Configure the EKS managed node group defaults
+#  eks_managed_node_group_defaults = {
+#    ami_type      = "AL2_x86_64"
+#    disk_size     = 20
+#    instance_type = "t3.micro"
+#  }
+#
+#  # Configure the EKS managed node groups
+#  eks_managed_node_groups = {
+#    eks_worker_group = {
+#      additional_tags = {
+#        Terraform = "true"
+#        EKS       = "mongodb-in-eks"
+#      }
+#    }
+#  }
+#
+#  depends_on = [
+#    aws_subnet.public
+#  ]
+#}
+
+output "aws_region" {
+  description = "The AWS region used for resources."
+  value       = var.aws_region
+}
+
+output "eks_cluster_arn" {
+  description = "The ARN of the EKS cluster."
+  value       = aws_eks_cluster.cluster.arn
+}
